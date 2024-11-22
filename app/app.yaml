@@ -1,0 +1,14 @@
+runtime: python312
+
+handlers:
+  # This handler routes all requests not caught above to your main app. It is
+  # required when static routes are defined, but can be omitted (along with
+  # the entire handlers section) when there are no static files defined.
+- url: /.*
+  script: auto
+
+env_variables:
+  CLIENT_ID: 'MgMoVr6k08iroaDnx2D7oIIN3z7Z8jxX'
+  CLIENT_SECRET: 'KyF_R4aRu2UVnLcZvOMBm1atu4RQcEwaC-4JzY8SbEhAWYXYJOqoy7X6kTaCGRg2'
+  DOMAIN: 'dev-t4axdq4jxv6m6szy.us.auth0.com'
+  ALGORITHMS: 'RS256'
