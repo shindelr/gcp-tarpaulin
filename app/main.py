@@ -33,6 +33,7 @@ ERR_MALFORMED_REQ = {"Error": "The request body is invalid"}  # 400
 ERR_UNAUTHORIZED = {"Error": "Unauthorized"}  # 401
 ERR_NOT_PERMITTED = {"Error": "You don't have permission on this resource"}  # 403
 ERR_RESOURCE_NOT_FOUND = {"Error": "Not found"}  # 404
+ERR_INVALID_ENROLLMENT = {"Error": "Enrollment data is invalid"}  # 409
 
 # CONFIGURATION
 app = Flask(__name__)
@@ -84,6 +85,24 @@ def verify_admin_by_request(request: requests.Request):
         payload = verify_jwt(request)
         query = client.query(kind=USERS)
         query.add_filter('role', '=', 'admin')
+        query.add_filter('sub', '=', payload['sub'])
+        user = list(query.fetch())
+        if len(user) < 1:
+            return 1
+        return payload
+
+    except AuthError as e:
+        logging.warning(e)
+        raise e  # Propogate the error up the chain.
+
+def verify_instructor_by_request(request: requests.Request):
+    """
+    Verify the user's JWT against admin subs.
+    """
+    try:
+        payload = verify_jwt(request)
+        query = client.query(kind=USERS)
+        query.add_filter('role', '=', 'instructor')
         query.add_filter('sub', '=', payload['sub'])
         user = list(query.fetch())
         if len(user) < 1:
@@ -405,6 +424,18 @@ def create_a_course():
             new_course['id'] = new_course.key.id
             new_course['self'] = url_for('get_a_course', course_id=new_course['id'], _external=True)
 
+            # Update the instructor to have this course now
+            instructor = client.get(client.key(USERS, content['instructor_id']))
+            if not instructor:
+                return ERR_MALFORMED_REQ, 400
+            teaching_courses = instructor.pop('courses')
+            if not teaching_courses:
+                teaching_courses = list()
+            if new_course['id'] not in teaching_courses:  # Avoid duplicates
+                teaching_courses.append(new_course['id'])
+                instructor.update({'courses': teaching_courses})
+                client.put(instructor)
+
         except KeyError as e:
             logging.warning("Key Error while creating a course. Check body.", e)
             return ERR_MALFORMED_REQ, 400
@@ -511,7 +542,65 @@ def update_a_course(course_id: int):
         403 Failure. JWT valid but not admin. OR JWT valid and admin, but no
             course exists by this ID    
     """
-    pass
+    try:
+        payload = verify_admin_by_request(request)
+        if payload == 1:
+            return ERR_NOT_PERMITTED, 403
+
+        # Get course in question
+        content = request.get_json()
+        course = client.get(client.key(COURSES, course_id))
+        
+        # Check on existing instructor, OK if instructor doesn't exist, NOT OK
+        # if instructor exists and is invalid. If the instructor is good, update
+        # their courses to include this course.
+        try:
+            instructor = client.get(client.key(USERS, content['instructor_id']))
+            if not instructor:
+                return ERR_MALFORMED_REQ, 400
+
+            teaching_courses = instructor.pop('courses')
+            if not teaching_courses:
+                teaching_courses = list()
+            if course_id not in teaching_courses:  # Avoid duplicates
+                teaching_courses.append(course_id)
+                instructor.update({'courses': teaching_courses})
+                client.put(instructor)
+        except KeyError as e:
+            logging.warning("No instructor ID provided in course update", e)
+            
+        if course:
+            # API assures that there will never be extraneous request attrs
+            for item in content:
+                course.update({f"{item}":content[f'{item}']})
+            client.put(course)
+            course['id'] = course.key.id
+            course['self'] = url_for('get_a_course', course_id=course['id'], _external=True)
+
+            # See if any other instructors are teaching the course, if so, remove
+            instructor_query = client.query(kind=USERS)
+            instructor_query.add_filter('courses', '=', course_id)
+            instructor_query.add_filter('role', '=', 'instructor')
+            instructors = list(instructor_query.fetch())
+            for instructor in instructors:
+                if instructor.key.id != course['instructor_id']:
+                    print(f"Popping id: {instructor.key.id}")
+                    print(f"Course instructor id: {course['instructor_id']}")
+                    teaching_courses = instructor.pop('courses')
+                    if not teaching_courses:
+                        teaching_courses = list()
+                    if course_id in teaching_courses:  # Remove other instructors
+                        teaching_courses.remove(course_id)
+                        instructor.update({'courses': teaching_courses})
+                        client.put(instructor)
+
+            return course, 201
+
+        return ERR_NOT_PERMITTED, 403
+
+    except AuthError as e:
+        logging.warning("Auth Error while updating a course", e)
+        return ERR_UNAUTHORIZED, 401
 
 @app.route(f'/{COURSES}/<int:course_id>', methods=['DELETE'])
 def delete_a_course(course_id: int):
@@ -533,7 +622,34 @@ def delete_a_course(course_id: int):
         403 Failure. JWT valid but not admin. OR JWT valid and admin, but no
             course exists by this ID.
     """
-    pass
+    try:
+        payload = verify_admin_by_request(request)
+        if payload == 1:
+            return ERR_NOT_PERMITTED, 403
+    
+        course = client.get(client.key(COURSES, course_id))
+        if course:
+            # Start by pruning the course ID out of everyone's enrollment
+            enrollment_q = client.query(kind=USERS)
+            enrollment_q.add_filter('courses', '=', course_id)
+            users = list(enrollment_q.fetch())
+            for user in users:
+                user_courses = user.pop('courses')
+                if not user_courses:
+                    user_courses = list()
+                user_courses.remove(course_id)
+                user.update({'courses': user_courses})
+                client.put(user)
+
+            # Delete the course itself
+            client.delete(course)
+            return '', 204
+    
+        return ERR_NOT_PERMITTED, 403
+
+    except AuthError as e:
+        logging.warning("Auth Error while deleting a course", e)
+        return ERR_UNAUTHORIZED, 401
 
 @app.route(f'/{COURSES}/<int:course_id>/{STUDENTS}', methods=['PATCH'])
 def update_course_enrollment(course_id: int):
@@ -566,7 +682,70 @@ def update_course_enrollment(course_id: int):
             students in the array must exist.
     
     """
-    pass
+    try:
+        # Must either be admin or instructor of the course
+        admin_payload = verify_admin_by_request(request)
+        instructor_payload = verify_instructor_by_request(request)
+        if admin_payload == 1 and instructor_payload == 1:
+            return ERR_NOT_PERMITTED, 403
+
+        print(instructor_payload)
+        course = client.get(client.key(COURSES, course_id))
+        if course:
+            # Check if instructor is the actual course instructor
+            if instructor_payload != 1:
+                instructor_query = client.query(kind=USERS)
+                instructor_query.add_filter('sub', '=', instructor_payload['sub'])
+                instructor = list(instructor_query.fetch())
+                print(instructor)
+                print(course['instructor_id'])
+                if instructor[0].key.id != course['instructor_id']:
+                    return ERR_NOT_PERMITTED, 403
+                
+            content = request.get_json()
+            add_list = content['add']
+            remove_list = content['remove']
+
+            # Check for student duplicates and db existence
+            for student_id in add_list:
+                if student_id in remove_list:
+                    return ERR_INVALID_ENROLLMENT, 409
+                db_user = client.get(client.key(USERS, student_id))
+                if not db_user or db_user['role'] != 'student':
+                    return ERR_INVALID_ENROLLMENT, 409
+            for student_id in remove_list:
+                db_user = client.get(client.key(USERS, student_id))
+                if not db_user or db_user['role'] != 'student':
+                    return ERR_INVALID_ENROLLMENT, 409
+
+            # Validated, update datastore entity now
+            for student_id in add_list:
+                student = client.get(client.key(USERS, student_id))
+                student_courses = student.pop('courses')
+                if not student_courses:
+                    student_courses = list()
+                if course_id not in student_courses:
+                    student_courses.append(course_id)
+                    student.update({'courses': student_courses})
+                    client.put(student)
+
+            for student_id in remove_list:
+                student = client.get(client.key(USERS, student_id))
+                student_courses = student.pop('courses')
+                if not student_courses:
+                    student_courses = list()
+                if course_id in student_courses:
+                    student_courses.remove(course_id)
+                    student.update({'courses': student_courses})
+                    client.put(student)
+
+            return '', 200
+    
+        return ERR_NOT_PERMITTED, 403
+
+    except AuthError as e:
+        logging.warning("Auth Error while deleting a course", e)
+        return ERR_UNAUTHORIZED, 401
 
 @app.route(f'/{COURSES}/<int:course_id>/{STUDENTS}', methods=['GET'])
 def get_course_enrollment(course_id: int):
@@ -587,7 +766,37 @@ def get_course_enrollment(course_id: int):
         403 Failure. JWT valid, but course doesn't exist. JWT/course valid but
             not an admin or instructor.
     """
-    pass
+    try:
+        # Must either be admin or instructor of the course
+        admin_payload = verify_admin_by_request(request)
+        instructor_payload = verify_instructor_by_request(request)
+        if admin_payload == 1 and instructor_payload == 1:
+            return ERR_NOT_PERMITTED, 403
+
+        course = client.get(client.key(COURSES, course_id))
+        if course:
+            # Check if instructor is the actual course instructor
+            if instructor_payload != 1:
+                instructor_query = client.query(kind=USERS)
+                instructor_query.add_filter('sub', '=', instructor_payload['sub'])
+                instructor = list(instructor_query.fetch())
+                if instructor[0].key.id != course['instructor_id']:
+                    return ERR_NOT_PERMITTED, 403
+            
+            # Query for all students in the course
+            student_query = client.query(kind=USERS)
+            student_query.add_filter('courses', '=', course_id)
+            student_query.add_filter('role', '=', 'student')
+            students = list(student_query.fetch())
+            student_ids = list()
+            for student in students:
+                student_ids.append(student.key.id)
+            return student_ids, 200
+    
+    except AuthError as e:
+        logging.warning("Auth Error while deleting a course", e)
+        return ERR_UNAUTHORIZED, 401
+    
 
 # JWT ROUTES, FUNCTIONS, ERROR HANDLERS
 @app.errorhandler(AuthError)
