@@ -303,9 +303,9 @@ def get_user_avatar(user_id:int):
         storage_client = storage.Client()
         bucket = storage_client.get_bucket(PROJ_BUCKET)
 
-        try:
+        if user['avatar_filename']:
             blob = bucket.blob(user['avatar_filename'])
-        except KeyError:
+        else:
             logging.warning("Tried to access non-existent avatar", 404)
             return ERR_RESOURCE_NOT_FOUND, 404
 
@@ -689,8 +689,8 @@ def update_course_enrollment(course_id: int):
         if admin_payload == 1 and instructor_payload == 1:
             return ERR_NOT_PERMITTED, 403
 
-        print(instructor_payload)
         course = client.get(client.key(COURSES, course_id))
+
         if course:
             # Check if instructor is the actual course instructor
             if instructor_payload != 1:
@@ -701,7 +701,6 @@ def update_course_enrollment(course_id: int):
                 print(course['instructor_id'])
                 if instructor[0].key.id != course['instructor_id']:
                     return ERR_NOT_PERMITTED, 403
-                
             content = request.get_json()
             add_list = content['add']
             remove_list = content['remove']
@@ -793,6 +792,7 @@ def get_course_enrollment(course_id: int):
                 student_ids.append(student.key.id)
             return student_ids, 200
     
+        return ERR_UNAUTHORIZED, 403
     except AuthError as e:
         logging.warning("Auth Error while deleting a course", e)
         return ERR_UNAUTHORIZED, 401
